@@ -37,15 +37,16 @@ class MarketMaker:
         secret_key, 
         symbol, 
         db_instance=None,
-        base_spread_percentage=0.2, 
-        order_quantity=None, 
-        max_orders=3, 
+        base_spread_percentage=0.2,
+        order_quantity=None,
+        max_orders=3,
         rebalance_threshold=15.0,
         enable_rebalance=True,
         base_asset_target_percentage=30.0,
         ws_proxy=None,
         exchange='backpack',
-        exchange_config=None
+        exchange_config=None,
+        dampening_factor=0.3,
     ):
         self.api_key = api_key
         self.secret_key = secret_key
@@ -54,6 +55,7 @@ class MarketMaker:
         self.order_quantity = order_quantity
         self.exchange = exchange
         self.exchange_config = exchange_config or {}
+        self.dampening_factor = dampening_factor
         
         # 初始化交易所客户端
         if exchange == 'backpack':
@@ -156,6 +158,7 @@ class MarketMaker:
         if self.enable_rebalance:
             logger.info(f"重平目標比例: {self.base_asset_target_percentage}% {self.base_asset} / {self.quote_asset_target_percentage}% {self.quote_asset}")
             logger.info(f"重平觸發閾值: {self.rebalance_threshold}%")
+        logger.info(f"庫存抑制因子 (dampening_factor): {self.dampening_factor}")
     
     def set_rebalance_settings(self, enable_rebalance=None, base_asset_target_percentage=None, rebalance_threshold=None):
         """
@@ -920,10 +923,35 @@ class MarketMaker:
     def calculate_dynamic_spread(self):
         """計算動態價差基於市場情況"""
         base_spread = self.base_spread_percentage
-        
+
         # 返回基礎價差，不再進行動態計算
         return base_spread
-    
+
+    def _calculate_inventory_skew(self) -> float:
+        """計算庫存偏移量 (-1 到 1 之間)。"""
+        try:
+            current_price = self.get_current_price()
+            if not current_price:
+                logger.warning("無法獲取當前價格，庫存偏移量計算為0")
+                return 0.0
+
+            _, base_total = self.get_asset_balance(self.base_asset)
+            _, quote_total = self.get_asset_balance(self.quote_asset)
+
+            base_value = base_total * current_price
+            quote_value = quote_total
+            total_value = base_value + quote_value
+
+            if total_value == 0:
+                return 0.0
+
+            inventory_skew = (base_value - quote_value) / total_value
+            inventory_skew = max(-1.0, min(1.0, inventory_skew))
+            return inventory_skew
+        except Exception as e:
+            logger.error(f"計算庫存偏移量時出錯: {e}")
+            return 0.0
+
     def calculate_prices(self):
         """計算買賣訂單價格"""
         try:
@@ -938,19 +966,30 @@ class MarketMaker:
                 mid_price = (bid_price + ask_price) / 2
             
             logger.info(f"市場中間價: {mid_price}")
-            
-            # 使用基礎價差
+
+            # 基於庫存偏移調整公允價
+            inventory_skew = self._calculate_inventory_skew()
             spread_percentage = self.base_spread_percentage
-            exact_spread = mid_price * (spread_percentage / 100)
-            
-            base_buy_price = mid_price - (exact_spread / 2)
-            base_sell_price = mid_price + (exact_spread / 2)
+            price_offset = mid_price * (spread_percentage / 100) * self.dampening_factor * inventory_skew
+            fair_price = mid_price - price_offset
+
+            logger.info(
+                "庫存偏移: %.4f, 價格偏移: %.8f, 公允價: %.8f",
+                inventory_skew,
+                price_offset,
+                fair_price,
+            )
+
+            exact_spread = fair_price * (spread_percentage / 100)
+
+            base_buy_price = fair_price - (exact_spread / 2)
+            base_sell_price = fair_price + (exact_spread / 2)
             
             base_buy_price = round_to_tick_size(base_buy_price, self.tick_size)
             base_sell_price = round_to_tick_size(base_sell_price, self.tick_size)
             
             actual_spread = base_sell_price - base_buy_price
-            actual_spread_pct = (actual_spread / mid_price) * 100
+            actual_spread_pct = (actual_spread / fair_price) * 100 if fair_price else 0
             logger.info(f"使用的價差: {actual_spread_pct:.4f}% (目標: {spread_percentage}%), 絕對價差: {actual_spread}")
             
             # 計算梯度訂單價格
@@ -972,7 +1011,7 @@ class MarketMaker:
                 sell_prices.append(sell_price)
             
             final_spread = sell_prices[0] - buy_prices[0]
-            final_spread_pct = (final_spread / mid_price) * 100
+            final_spread_pct = (final_spread / fair_price) * 100 if fair_price else 0
             logger.info(f"最終價差: {final_spread_pct:.4f}% (最低賣價 {sell_prices[0]} - 最高買價 {buy_prices[0]} = {final_spread})")
             
             return buy_prices, sell_prices
