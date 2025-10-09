@@ -37,6 +37,8 @@ def parse_arguments():
     parser.add_argument('--max-position', type=float, default=1.0, help='永續合約最大允許倉位(絕對值)')
     parser.add_argument('--position-threshold', type=float, default=0.1, help='永續倉位調整觸發值')
     parser.add_argument('--inventory-skew', type=float, default=0.0, help='永續倉位偏移調整係數 (0-1)')
+    parser.add_argument('--dampening-factor', type=float, default=0.3, help='庫存偏移對報價影響的抑制因子 (0-1)')
+    parser.add_argument('--requote-threshold-bps', type=float, default=10.0, help='重新掛單所需的中間價變動閾值 (基點)')
     parser.add_argument('--stop-loss', type=float, help='永續倉位止損觸發值 (以報價資產計價)')
     parser.add_argument('--take-profit', type=float, help='永續倉位止盈觸發值 (以報價資產計價)')
     
@@ -138,6 +140,8 @@ def main():
                 logger.info(f"  最大持倉量: {args.max_position}")
                 logger.info(f"  倉位觸發值: {args.position_threshold}")
                 logger.info(f"  報價偏移係數: {args.inventory_skew}")
+                logger.info(f"  庫存抑制因子: {args.dampening_factor}")
+                logger.info(f"  報價刷新閾值: {args.requote_threshold_bps} bps")
                 market_maker = PerpetualMarketMaker(
                     api_key=api_key,
                     secret_key=secret_key,
@@ -149,6 +153,8 @@ def main():
                     max_position=args.max_position,
                     position_threshold=args.position_threshold,
                     inventory_skew=args.inventory_skew,
+                    dampening_factor=args.dampening_factor,
+                    price_requote_threshold_bps=args.requote_threshold_bps,
                     stop_loss=args.stop_loss,
                     take_profit=args.take_profit,
                     ws_proxy=ws_proxy,
@@ -183,6 +189,8 @@ def main():
                     quote_asset_target_percentage = 100.0 - base_asset_target_percentage
                     logger.info(f"  目標比例: {base_asset_target_percentage}% 基礎資產 / {quote_asset_target_percentage}% 報價資產")
                     logger.info(f"  觸發閾值: {rebalance_threshold}%")
+                logger.info(f"  庫存抑制因子: {args.dampening_factor}")
+                logger.info(f"  報價刷新閾值: {args.requote_threshold_bps} bps")
 
                 market_maker = MarketMaker(
                     api_key=api_key,
@@ -196,7 +204,9 @@ def main():
                     rebalance_threshold=rebalance_threshold,
                     ws_proxy=ws_proxy,
                     exchange=exchange,
-                    exchange_config=exchange_config
+                    exchange_config=exchange_config,
+                    dampening_factor=args.dampening_factor,
+                    price_requote_threshold_bps=args.requote_threshold_bps,
                 )
             
             # 執行做市策略

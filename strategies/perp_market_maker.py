@@ -715,6 +715,12 @@ class PerpetualMarketMaker(MarketMaker):
             logger.warning("報價調整後買賣價交叉或價差過小，恢復原始報價。買: %s, 賣: %s", adjusted_buys[0], adjusted_sells[0])
             return buy_prices, sell_prices
 
+        context = getattr(self, "_latest_price_context", None)
+        if isinstance(context, dict):
+            context["buy_prices"] = adjusted_buys
+            context["sell_prices"] = adjusted_sells
+            self._latest_price_context = context
+
         return adjusted_buys, adjusted_sells
 
     # ------------------------------------------------------------------

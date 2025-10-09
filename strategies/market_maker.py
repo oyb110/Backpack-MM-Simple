@@ -37,15 +37,17 @@ class MarketMaker:
         secret_key, 
         symbol, 
         db_instance=None,
-        base_spread_percentage=0.2, 
-        order_quantity=None, 
-        max_orders=3, 
+        base_spread_percentage=0.2,
+        order_quantity=None,
+        max_orders=3,
         rebalance_threshold=15.0,
         enable_rebalance=True,
         base_asset_target_percentage=30.0,
         ws_proxy=None,
         exchange='backpack',
-        exchange_config=None
+        exchange_config=None,
+        dampening_factor=0.3,
+        price_requote_threshold_bps=10.0,
     ):
         self.api_key = api_key
         self.secret_key = secret_key
@@ -54,6 +56,9 @@ class MarketMaker:
         self.order_quantity = order_quantity
         self.exchange = exchange
         self.exchange_config = exchange_config or {}
+        self.dampening_factor = dampening_factor
+        self.price_requote_threshold_bps = max(price_requote_threshold_bps, 0.0)
+        self.price_requote_threshold = self.price_requote_threshold_bps / 10000
         
         # 初始化交易所客户端
         if exchange == 'backpack':
@@ -122,6 +127,12 @@ class MarketMaker:
         self.orders_placed = 0
         self.orders_cancelled = 0
 
+        # 報價刷新狀態
+        self.last_mid_price: Optional[float] = None
+        self.last_fair_price: Optional[float] = None
+        self._latest_price_context: Optional[Dict[str, Any]] = None
+        self._force_requote: bool = False
+
         # 風控狀態
         self._stop_trading = False
         self.stop_reason: Optional[str] = None
@@ -156,6 +167,12 @@ class MarketMaker:
         if self.enable_rebalance:
             logger.info(f"重平目標比例: {self.base_asset_target_percentage}% {self.base_asset} / {self.quote_asset_target_percentage}% {self.quote_asset}")
             logger.info(f"重平觸發閾值: {self.rebalance_threshold}%")
+        logger.info(f"庫存抑制因子 (dampening_factor): {self.dampening_factor}")
+        logger.info(
+            "報價刷新閾值: %.2f bps (%.5f%%)",
+            self.price_requote_threshold_bps,
+            self.price_requote_threshold * 100,
+        )
     
     def set_rebalance_settings(self, enable_rebalance=None, base_asset_target_percentage=None, rebalance_threshold=None):
         """
@@ -920,66 +937,162 @@ class MarketMaker:
     def calculate_dynamic_spread(self):
         """計算動態價差基於市場情況"""
         base_spread = self.base_spread_percentage
-        
+
         # 返回基礎價差，不再進行動態計算
         return base_spread
-    
-    def calculate_prices(self):
-        """計算買賣訂單價格"""
+
+    def _calculate_inventory_skew(self) -> float:
+        """計算庫存偏移量 (-1 到 1 之間)。"""
+        try:
+            current_price = self.get_current_price()
+            if not current_price:
+                logger.warning("無法獲取當前價格，庫存偏移量計算為0")
+                return 0.0
+
+            _, base_total = self.get_asset_balance(self.base_asset)
+            _, quote_total = self.get_asset_balance(self.quote_asset)
+
+            base_value = base_total * current_price
+            quote_value = quote_total
+            total_value = base_value + quote_value
+
+            if total_value == 0:
+                return 0.0
+
+            inventory_skew = (base_value - quote_value) / total_value
+            inventory_skew = max(-1.0, min(1.0, inventory_skew))
+            return inventory_skew
+        except Exception as e:
+            logger.error(f"計算庫存偏移量時出錯: {e}")
+            return 0.0
+
+    def _calculate_price_context(self) -> Optional[Dict[str, Any]]:
+        """計算報價所需的上下文資訊。"""
         try:
             bid_price, ask_price = self.get_market_depth()
             if bid_price is None or ask_price is None:
                 current_price = self.get_current_price()
                 if current_price is None:
                     logger.error("無法獲取價格信息，無法設置訂單")
-                    return None, None
+                    return None
                 mid_price = current_price
             else:
                 mid_price = (bid_price + ask_price) / 2
-            
+
             logger.info(f"市場中間價: {mid_price}")
-            
-            # 使用基礎價差
+
+            inventory_skew = self._calculate_inventory_skew()
             spread_percentage = self.base_spread_percentage
-            exact_spread = mid_price * (spread_percentage / 100)
-            
-            base_buy_price = mid_price - (exact_spread / 2)
-            base_sell_price = mid_price + (exact_spread / 2)
-            
+            price_offset = mid_price * (spread_percentage / 100) * self.dampening_factor * inventory_skew
+            fair_price = mid_price - price_offset
+
+            logger.info(
+                "庫存偏移: %.4f, 價格偏移: %.8f, 公允價: %.8f",
+                inventory_skew,
+                price_offset,
+                fair_price,
+            )
+
+            exact_spread = fair_price * (spread_percentage / 100)
+
+            base_buy_price = fair_price - (exact_spread / 2)
+            base_sell_price = fair_price + (exact_spread / 2)
+
             base_buy_price = round_to_tick_size(base_buy_price, self.tick_size)
             base_sell_price = round_to_tick_size(base_sell_price, self.tick_size)
-            
+
             actual_spread = base_sell_price - base_buy_price
-            actual_spread_pct = (actual_spread / mid_price) * 100
+            actual_spread_pct = (actual_spread / fair_price) * 100 if fair_price else 0
             logger.info(f"使用的價差: {actual_spread_pct:.4f}% (目標: {spread_percentage}%), 絕對價差: {actual_spread}")
-            
-            # 計算梯度訂單價格
+
             buy_prices = []
             sell_prices = []
-            
-            # 優化梯度分佈：較小的梯度以提高成交率
             for i in range(self.max_orders):
-                # 非線性遞增的梯度，靠近中間的訂單梯度小，越遠離中間梯度越大
                 gradient_factor = (i ** 1.5) * 1.5
-                
+
                 buy_adjustment = gradient_factor * self.tick_size
                 sell_adjustment = gradient_factor * self.tick_size
-                
+
                 buy_price = round_to_tick_size(base_buy_price - buy_adjustment, self.tick_size)
                 sell_price = round_to_tick_size(base_sell_price + sell_adjustment, self.tick_size)
-                
+
                 buy_prices.append(buy_price)
                 sell_prices.append(sell_price)
-            
+
             final_spread = sell_prices[0] - buy_prices[0]
-            final_spread_pct = (final_spread / mid_price) * 100
-            logger.info(f"最終價差: {final_spread_pct:.4f}% (最低賣價 {sell_prices[0]} - 最高買價 {buy_prices[0]} = {final_spread})")
-            
-            return buy_prices, sell_prices
-        
+            final_spread_pct = (final_spread / fair_price) * 100 if fair_price else 0
+            logger.info(
+                f"最終價差: {final_spread_pct:.4f}% (最低賣價 {sell_prices[0]} - 最高買價 {buy_prices[0]} = {final_spread})"
+            )
+
+            context = {
+                "mid_price": mid_price,
+                "fair_price": fair_price,
+                "inventory_skew": inventory_skew,
+                "price_offset": price_offset,
+                "buy_prices": buy_prices,
+                "sell_prices": sell_prices,
+            }
+            self._latest_price_context = context
+            return context
+
         except Exception as e:
             logger.error(f"計算價格時出錯: {str(e)}")
+            return None
+
+    def calculate_prices(self):
+        """計算買賣訂單價格"""
+        context = self._calculate_price_context()
+        if not context:
             return None, None
+
+        buy_prices = context["buy_prices"]
+        sell_prices = context["sell_prices"]
+        # 保持上下文中的價格與返回值一致
+        self._latest_price_context = context
+        return buy_prices, sell_prices
+
+    def _should_refresh_quotes(self, price_context: Dict[str, Any]) -> bool:
+        """根據最新行情判斷是否需要刷新報價。"""
+        if self._force_requote:
+            logger.debug("強制刷新標記已設置，執行報價更新。")
+            self._force_requote = False
+            return True
+
+        mid_price = price_context.get("mid_price")
+        if mid_price is None or mid_price <= 0:
+            logger.debug("無有效中間價資料，重新生成報價。")
+            return True
+
+        if self.last_mid_price is None:
+            logger.debug("首次生成報價，執行刷新。")
+            return True
+
+        if not self.active_buy_orders and not self.active_sell_orders:
+            logger.debug("當前無任何掛單，重新生成報價。")
+            return True
+
+        if self.price_requote_threshold <= 0:
+            logger.debug("報價刷新閾值為0，始終刷新。")
+            return True
+
+        diff = abs(mid_price - self.last_mid_price)
+        relative_change = diff / self.last_mid_price if self.last_mid_price else 0
+
+        if relative_change >= self.price_requote_threshold:
+            logger.info(
+                "中間價變動 %.5f%% 超過閾值 %.5f%%，刷新報價。",
+                relative_change * 100,
+                self.price_requote_threshold * 100,
+            )
+            return True
+
+        logger.info(
+            "中間價變動 %.5f%% 低於閾值 %.5f%%，保持現有掛單。",
+            relative_change * 100,
+            self.price_requote_threshold * 100,
+        )
+        return False
     
     def need_rebalance(self):
         """判斷是否需要重平衡倉位（基於總餘額包含抵押品）"""
@@ -1204,12 +1317,16 @@ class MarketMaker:
     def place_limit_orders(self):
         """下限價單（使用總餘額包含抵押品）"""
         self.check_ws_connection()
-        self.cancel_existing_orders()
-        
         buy_prices, sell_prices = self.calculate_prices()
         if buy_prices is None or sell_prices is None:
             logger.error("無法計算訂單價格，跳過下單")
             return
+
+        price_context = self._latest_price_context or {}
+        if not self._should_refresh_quotes(price_context):
+            return
+
+        self.cancel_existing_orders()
         
         # 處理訂單數量
         if self.order_quantity is None:
@@ -1333,6 +1450,10 @@ class MarketMaker:
                 sell_order_count += 1
             
         logger.info(f"共下單: {buy_order_count} 個買單, {sell_order_count} 個賣單")
+
+        if price_context:
+            self.last_mid_price = price_context.get("mid_price")
+            self.last_fair_price = price_context.get("fair_price")
     
     def cancel_existing_orders(self):
         """取消所有現有訂單"""

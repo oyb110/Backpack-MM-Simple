@@ -12,6 +12,7 @@ Twitter：[Yan Practice ⭕散修](https://x.com/practice_y11)
 
 - **多交易所架構**：支援 Backpack、未來可擴展至其他交易所
 - **自動化做市策略**：智能價差管理和訂單調整
+- **庫存感知報價**：以公允價為中心的動態掛單，並僅在價格超過閾值時重新掛單
 - **永續合約做市**：倉位風險管理與風險中性機制
 - **智能重平衡系統**：自動維持資產配置比例
 - **增強日誌系統**：詳細的市場狀態和策略追蹤
@@ -139,6 +140,8 @@ python run.py --exchange backpack --symbol SOL_USDC --spread 0.5 --max-orders 3 
 - `--max-position`: 永續合約最大允許淨倉 (僅 `perp` 模式)
 - `--position-threshold`: 永續倉位調整觸發值 (僅 `perp` 模式)
 - `--inventory-skew`: 永續做市報價偏移係數 (0-1，僅 `perp` 模式)
+- `--dampening-factor`: 庫存偏移對報價中心影響的抑制因子 (默認: 0.3)
+- `--requote-threshold-bps`: 重新掛單所需的中間價變動閾值（基點，默認: 10bps）
 - `--stop-loss`: 以報價資產計價的未實現止損閾值 (僅 `perp` 模式)
 - `--take-profit`: 以報價資產計價的未實現止盈閾值 (僅 `perp` 模式)
 
